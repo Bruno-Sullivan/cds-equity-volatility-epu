@@ -1,0 +1,1250 @@
+---
+title: "Running Results"
+author: "Bruno Sullivan"
+date: "2025-12-05"
+output: html_document
+---
+##Creation of Sectoral Portfolios##
+```{r}
+library(dplyr)
+
+
+#call our compiled database#
+
+df3 <- combined_data
+
+sector_daily <- df3 %>%
+  group_by(sector, date) %>%
+  summarise(
+    RET_eq  = mean(RET,       na.rm = TRUE),  
+    PS_eq   = mean(parspread, na.rm = TRUE), 
+    n_firms = n_distinct(ticker),
+    .groups = "drop"
+)
+
+library(tidyr)
+library(purrr)
+
+##create correlation matrix so we can take portfolio variance##
+
+sector_corr <- df3 %>%
+  dplyr::select(sector, date, ticker, RET) %>%
+  group_by(sector) %>%
+  group_modify(~ {
+    wide <- .x %>%
+      dplyr::select(date, ticker, RET) %>%
+      pivot_wider(names_from = ticker, values_from = RET) %>%
+      arrange(date)
+
+  
+    R_mat <- as.matrix(wide[ , -1, drop = FALSE])
+
+    rho  <- cor(R_mat, use = "pairwise.complete.obs")
+
+    tibble(cor_mat = list(rho))
+  }) %>%
+  ungroup()
+
+
+sector_iv <- df3 %>%
+  dplyr::select(sector, date, ticker, impl_volatility) %>%
+
+  left_join(sector_corr, by = "sector") %>%
+  group_by(sector, date) %>%
+  group_modify(~ {
+   
+    sigma <- .x$impl_volatility
+    names(sigma) <- .x$ticker
+
+
+    rho <- .x$cor_mat[[1]]
+
+ 
+    common_tickers <- intersect(names(sigma), colnames(rho))
+    sigma <- sigma[common_tickers]
+    rho   <- rho[common_tickers, common_tickers, drop = FALSE]
+
+    n <- length(sigma)
+    if (n <= 1L || any(is.na(sigma))) {
+
+      return(tibble(sector_iv = NA_real_))
+    }
+
+
+    Sigma_impl <- (sigma %o% sigma) * rho
+
+
+    w <- rep(1 / n, n)
+
+    sigma2_P <- as.numeric(t(w) %*% Sigma_impl %*% w)
+    tibble(sector_iv = sqrt(sigma2_P))
+  }) %>%
+  ungroup()
+
+##SECTOR database##
+sector_panel <- sector_daily %>%
+  left_join(sector_iv, by = c("sector", "date"))
+```
+
+##TVAR model sectoral###
+```{r}
+library(dplyr)
+
+epu_daily <- df3[, c("date", "daily_policy_index")]
+epu_daily <- unique(epu_daily)
+
+sector_panel$EPU <- epu_daily$daily_policy_index[
+  match(sector_panel$date, epu_daily$date)
+]
+
+library(dplyr)
+library(tidyr)
+library(tsDyn)
+
+sectors <- unique(sector_panel$sector)
+sector_models <- list()
+
+###loop through each sector#
+for (sec in sectors) {
+
+  ##taking diff of variables, returns is alr a difference##
+
+  df_s <- sector_panel %>%
+    filter(sector == sec) %>%
+    arrange(date) %>%
+    mutate(
+      d_cds = PS_eq     - lag(PS_eq),
+      d_vol = sector_iv - lag(sector_iv),
+      ret   = RET_eq
+    ) %>%
+    drop_na(d_cds, d_vol, ret, EPU)
+
+
+  Y <- as.matrix(df_s[, c("d_cds", "d_vol", "ret")])
+
+
+  th <- df_s$EPU
+
+  model_sec <- tsDyn::TVAR(
+    data    = Y,
+    lag     = 2,
+    nthresh = 1,
+    thDelay = 1,
+    trim    = 0.15,
+    thVar   = th,
+    model   = "TAR"
+  )
+
+  sector_models[[sec]] <- model_sec
+}
+
+
+library(dplyr)
+library(tibble)
+
+threshold_table <- tibble(
+  Sector     = names(sector_models),
+  Threshold  = sapply(sector_models, \(m) m$model.specific$Thresh)
+)
+
+threshold_table
+```
+
+
+
+###Wald Test###
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(vars)
+library(purrr)
+library(tibble)
+
+var_names <- c("d_cds", "ret", "d_vol")
+
+run_regime_granger_for_sector <- function(sec, sector_panel, sector_models, p = 2) {
+
+  ##same as above##
+
+  df_s <- sector_panel %>%
+    filter(sector == sec) %>%
+    arrange(date) %>%
+    mutate(
+      d_cds = PS_eq     - lag(PS_eq),
+      d_vol = sector_iv - lag(sector_iv),
+      ret   = RET_eq
+    ) %>%
+    tidyr::drop_na(d_cds, d_vol, ret, EPU)
+
+  mod_sec    <- sector_models[[sec]]
+  regime_vec <- mod_sec$model.specific$regime
+
+  stopifnot(length(regime_vec) == nrow(df_s))
+
+
+  df_reg <- df_s
+  df_reg$regime <- regime_vec
+
+  df_reg <- df_reg[, c("date", var_names, "EPU", "regime")]
+
+
+  df_reg <- df_reg[complete.cases(df_reg[, c(var_names, "regime")]), , drop = FALSE]
+##splitting regime##
+
+
+  df_low  <- df_reg[df_reg$regime == 1, var_names, drop = FALSE]
+  df_high <- df_reg[df_reg$regime == 2, var_names, drop = FALSE]
+
+
+  df_low  <- df_low[complete.cases(df_low),  , drop = FALSE]
+  df_high <- df_high[complete.cases(df_high), , drop = FALSE]
+
+  if (nrow(df_low) <= p || nrow(df_high) <= p) {
+    return(
+      tibble(
+        sector    = sec,
+        direction = c("VOL → CDS", "RET → CDS", "CDS → VOL"),
+        p_low     = NA_real_,
+        p_high    = NA_real_
+      )
+    )
+  }
+
+
+  var_low  <- VAR(df_low,  p = p, type = "const")
+  var_high <- VAR(df_high, p = p, type = "const")
+
+
+
+
+  p_low_VtoCDS  <- causality(var_low,  cause = "d_vol")$Granger$p.value
+  p_high_VtoCDS <- causality(var_high, cause = "d_vol")$Granger$p.value
+
+
+  p_low_RtoCDS  <- causality(var_low,  cause = "ret")$Granger$p.value
+  p_high_RtoCDS <- causality(var_high, cause = "ret")$Granger$p.value
+
+
+  p_low_CDStoV  <- causality(var_low,  cause = "d_cds")$Granger$p.value
+  p_high_CDStoV <- causality(var_high, cause = "d_cds")$Granger$p.value
+
+  tibble(
+    sector    = sec,
+    direction = c("VOL → CDS", "RET → CDS", "CDS → VOL"),
+    p_low     = c(p_low_VtoCDS,  p_low_RtoCDS,  p_low_CDStoV),
+    p_high    = c(p_high_VtoCDS, p_high_RtoCDS, p_high_CDStoV)
+  )
+}
+
+
+sectors <- names(sector_models)
+
+granger_sector_results <- purrr::map_dfr(
+  sectors,
+  ~ run_regime_granger_for_sector(.x, sector_panel, sector_models, p = 2)
+)
+
+granger_sector_results
+
+add_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p)      ~ "",
+    p < 0.01      ~ "***",
+    p < 0.05      ~ "**",
+    p < 0.10      ~ "*",
+    TRUE          ~ ""
+  )
+}
+
+granger_sector_results2 <- granger_sector_results %>%
+  dplyr::mutate(
+    direction_code = dplyr::case_when(
+      direction == "VOL: CDS" ~ "V:CDS",
+      direction == "RET: CDS" ~ "RET:CDS",
+      direction == "CDS: VOL" ~ "CDS:V",
+      TRUE ~ direction  
+    )
+  )
+
+granger_sector_results2 <- granger_sector_results2 %>%
+  dplyr::mutate(
+    p_low_str  = ifelse(is.na(p_low),
+                        NA_character_,
+                        paste0(round(p_low, 3), add_stars(p_low))),
+    p_high_str = ifelse(is.na(p_high),
+                        NA_character_,
+                        paste0(round(p_high, 3), add_stars(p_high)))
+  )
+
+table_wide <- granger_sector_results2 %>%
+  tidyr::pivot_wider(
+    id_cols = sector,
+    names_from  = direction_code,
+    values_from = c(p_low_str, p_high_str),
+    names_glue  = "{direction_code}_{.value}"
+  )
+
+```
+
+
+###Daily EPU data chart###
+
+```{r}
+library(ggplot2)
+ggplot(df_tvar, aes(x = Date, y = EPU)) +
+  geom_line(color = "blue") +
+  theme_minimal() +
+  labs(title = "Daily EPU", y = "EPU Index", x = "Date")
+
+```
+
+##overall portfolio###
+```{r}
+
+df_notele <- df3 %>%
+  filter(sector != "Telecommunication Services")
+###dropped telecom not enough obs##
+
+market_daily <- df_notele %>%
+  group_by(date) %>%
+  summarise(
+    RET_eq  = mean(RET,       na.rm = TRUE),  
+    PS_eq   = mean(parspread, na.rm = TRUE), 
+    n_firms = n_distinct(ticker),
+    .groups = "drop"
+)
+
+##same building of portfolio variance##
+
+ret_wide <- df3 %>%
+  dplyr::select(date, ticker, RET) %>%
+  pivot_wider(names_from = ticker, values_from = RET) %>%
+  arrange(date)
+
+R_mat_all <- as.matrix(ret_wide[, -1, drop = FALSE])  # drop date
+rho_all   <- cor(R_mat_all, use = "pairwise.complete.obs")
+
+
+
+market_iv <- df3 %>%
+  dplyr::select(date, ticker, impl_volatility) %>%
+  group_by(date) %>%
+  group_modify(~ {
+    sigma <- .x$impl_volatility
+    names(sigma) <- .x$ticker
+
+ 
+    common <- intersect(names(sigma), colnames(rho_all))
+    sigma  <- sigma[common]
+    rho    <- rho_all[common, common, drop = FALSE]
+
+    n <- length(sigma)
+    if (n <= 1L || any(is.na(sigma))) {
+      return(tibble(port_iv = NA_real_))
+    }
+
+
+    Sigma_impl <- (sigma %o% sigma) * rho
+
+  
+    w <- rep(1 / n, n)
+    sigma2_P <- as.numeric(t(w) %*% Sigma_impl %*% w)
+
+    tibble(port_iv = sqrt(sigma2_P))
+  }) %>%
+  ungroup()
+
+epu_daily <- df3[, c("date", "daily_policy_index")] %>%
+  distinct()
+##make sure is merged w EPU and has right dates#
+market_panel <- market_daily %>%
+  left_join(market_iv, by = "date") %>%
+  mutate(
+    EPU = epu_daily$daily_policy_index[
+      match(date, epu_daily$date)
+    ]
+  ) %>%
+  filter(
+    date >= as.Date("2017-01-01"),
+    date <= as.Date("2023-12-31")
+  )
+```
+
+
+###TVAR on entire market
+
+```{r}
+df_m <- market_panel %>%
+  arrange(date) %>%
+  mutate(
+    d_cds = PS_eq  - lag(PS_eq),
+    d_vol = port_iv - lag(port_iv),
+    ret   = RET_eq
+  ) %>%
+  drop_na(d_cds, d_vol, ret, EPU)
+
+Y  <- as.matrix(df_m[, c("d_cds", "d_vol", "ret")])
+th <- df_m$EPU
+
+
+tvar_market <- TVAR(
+  data    = Y,
+  lag     = 2,
+  nthresh = 1,
+  thDelay = 1,
+  trim    = 0.15,   
+  thVar   = th,
+  model   = "TAR"
+)
+
+tvar_market
+
+
+market_df <- market_panel %>%       
+  arrange(date) %>%
+  mutate(
+    d_cds = PS_eq     - lag(PS_eq),
+    d_vol = port_iv - lag(port_iv),  
+    ret   = RET_eq
+  ) %>%
+  drop_na(d_cds, d_vol, ret, EPU)
+
+var_names <- c("d_cds", "d_vol", "ret")
+p_lag     <- 2
+
+
+Y_market <- as.matrix(market_df[, var_names])
+
+tvar_market <- tsDyn::TVAR(
+  data    = Y_market,
+  lag     = p_lag,
+  nthresh = 1,
+  thDelay = 1,
+  trim    = 0.15,
+  thVar   = market_df$EPU,
+  model   = "TAR"
+)
+library(dplyr)
+library(tidyr)
+library(vars)
+library(tsDyn)
+library(tibble)
+
+
+market_df <- market_panel %>%
+  arrange(date) %>%
+  mutate(
+    d_cds = PS_eq   - lag(PS_eq),
+    d_vol = port_iv - lag(port_iv),
+    ret   = RET_eq
+  ) %>%
+  drop_na(d_cds, d_vol, ret, EPU)
+
+var_names <- c("d_cds", "d_vol", "ret")
+p_lag     <- 2
+
+
+Y_market <- as.matrix(market_df[, var_names])
+
+tvar_market <- TVAR(
+  data    = Y_market,
+  lag     = p_lag,
+  nthresh = 1,
+  thDelay = 1,
+  trim    = 0.15,
+  thVar   = market_df$EPU,
+  model   = "TAR"
+)
+
+
+regime_vec <- tvar_market$model.specific$regime
+stopifnot(length(regime_vec) == nrow(market_df))
+
+df_reg <- market_df %>%
+  mutate(regime = regime_vec) %>%
+  dplyr::select(date, all_of(var_names), EPU, regime) %>%
+  drop_na(d_cds, d_vol, ret, regime)
+
+df_low  <- df_reg %>% filter(regime == 1) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+df_high <- df_reg %>% filter(regime == 2) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+
+N_low  <- nrow(df_low)
+N_high <- nrow(df_high)
+
+if (N_low <= p_lag | N_high <= p_lag) stop("Not enough obs in one regime for VAR.")
+
+
+var_low  <- VAR(df_low,  p = p_lag, type = "const")
+var_high <- VAR(df_high, p = p_lag, type = "const")
+
+
+
+wald_results <- tibble::tibble(
+  direction = c("d_vol → d_cds", "ret → d_cds", "d_cds → d_vol"),
+
+
+  p_low = c(
+    vars::causality(var_low,  cause = "d_vol")$Granger$p.value,
+    vars::causality(var_low,  cause = "ret")   $Granger$p.value,
+    vars::causality(var_low,  cause = "d_cds") $Granger$p.value
+  ),
+
+
+  p_high = c(
+    vars::causality(var_high, cause = "d_vol")$Granger$p.value,
+    vars::causality(var_high, cause = "ret")   $Granger$p.value,
+    vars::causality(var_high, cause = "d_cds") $Granger$p.value
+  )
+)
+
+wald_results
+
+###make our output table###
+
+
+add_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p < 0.01 ~ "***",
+    p < 0.05 ~ "**",
+    p < 0.10 ~ "*",
+    TRUE     ~ ""
+  )
+}
+
+tidy_var <- function(var_model) {
+  res_list <- var_model$varresult
+  bind_rows(lapply(names(res_list), function(eq) {
+    sm    <- summary(res_list[[eq]])
+    coefs <- coef(sm)   # Estimate, Std. Error, t value, Pr(>|t|)
+    tibble(
+      equation = eq,
+      term     = rownames(coefs),
+      estimate = coefs[, "Estimate"],
+      p_value  = coefs[, "Pr(>|t|)"]
+    )
+  }))
+}
+
+desired_terms <- c(
+  "(Intercept)",
+  "d_cds.l1", "d_vol.l1", "ret.l1",
+  "d_cds.l2", "d_vol.l2", "ret.l2"
+)
+
+format_var_table <- function(var_model) {
+  tidy_var(var_model) %>%
+    filter(term %in% desired_terms) %>%
+    mutate(
+      term    = factor(term, levels = desired_terms),
+      est_str = sprintf("%.4f%s", round(estimate, 4), add_stars(p_value))
+    ) %>%
+    dplyr::select(equation, term, est_str) %>%
+    pivot_wider(names_from = term, values_from = est_str) %>%
+    arrange(equation)
+}
+
+market_low_tab  <- format_var_table(var_low)
+market_high_tab <- format_var_table(var_high)
+
+library(flextable)
+ library(officer)
+ doc <- read_docx()
+ doc <- body_add_par(doc,
+   value = sprintf("Market – Low EPU (N = %d)", N_low), style = "heading 2")
+ doc <- body_add_flextable(doc, flextable(market_low_tab))
+ doc <- body_add_par(doc, value = "", style = "Normal")
+ doc <- body_add_par(doc,
+   value = sprintf("Market – High EPU (N = %d)", N_high), style = "heading 2")
+ doc <- body_add_flextable(doc, flextable(market_high_tab))
+ doc <- body_add_par(doc, value = "", style = "Normal")
+ print(doc, target = "10market_TVAR_VARcoeffs.docx")
+
+```
+
+
+
+#market joint portmanteau test###
+```{r}
+library(vars)
+lag_pt <- 10   
+
+pt_low  <- serial.test(var_low,  lags.pt = lag_pt, type = "PT.asymptotic")
+pt_high <- serial.test(var_high, lags.pt = lag_pt, type = "PT.asymptotic")
+
+joint_portmanteau_market <- tibble::tibble(
+  regime  = c("Low EPU", "High EPU"),
+  N       = c(N_low, N_high),
+  p_value = c(
+    pt_low$serial$p.value,
+    pt_high$serial$p.value
+  )
+) 
+
+joint_portmanteau_market
+
+```
+
+
+#creation of robustness check table#
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(vars)
+library(tsDyn)
+library(tibble)
+library(flextable)
+library(officer)
+
+var_names <- c("d_cds", "d_vol", "ret")
+p_lag     <- 2
+
+
+
+market_df <- market_panel %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(
+    d_cds = PS_eq   - dplyr::lag(PS_eq),
+    d_vol = port_iv - dplyr::lag(port_iv),
+    ret   = RET_eq
+  ) %>%
+  tidyr::drop_na(d_cds, d_vol, ret, EPU)
+
+
+add_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "",
+    p < 0.01 ~ "***",
+    p < 0.05 ~ "**",
+    p < 0.10 ~ "*",
+    TRUE     ~ ""
+  )
+}
+
+tidy_var <- function(v) {
+  res_list <- v$varresult
+  dplyr::bind_rows(lapply(names(res_list), function(eq) {
+    sm    <- summary(res_list[[eq]])
+    coefs <- coef(sm)
+    tibble::tibble(
+      equation = eq,
+      term     = rownames(coefs),
+      estimate = coefs[, "Estimate"],
+      p_value  = coefs[, "Pr(>|t|)"]
+    )
+  }))
+}
+
+desired_terms <- c(
+  "(Intercept)",
+  "d_cds.l1", "d_vol.l1", "ret.l1",
+  "d_cds.l2", "d_vol.l2", "ret.l2"
+)
+
+format_var_table <- function(v) {
+  tidy_var(v) %>%
+    dplyr::filter(term %in% desired_terms) %>%
+    dplyr::mutate(
+      term    = factor(term, levels = desired_terms),
+      est_str = sprintf("%.4f%s", round(estimate, 4), add_stars(p_value))
+    ) %>%
+    dplyr::select(equation, term, est_str) %>%
+    tidyr::pivot_wider(names_from = term, values_from = est_str) %>%
+    dplyr::arrange(equation)
+}
+
+
+run_market_tvar_tables <- function(trim_val) {
+
+  Y_market <- as.matrix(market_df[, var_names])
+
+  tvar_market <- tsDyn::TVAR(
+    data    = Y_market,
+    lag     = p_lag,
+    nthresh = 1,
+    thDelay = 1,
+    trim    = trim_val,
+    thVar   = market_df$EPU,
+    model   = "TAR"
+  )
+
+  tau        <- as.numeric(tvar_market$model.specific$Thresh)
+  regime_vec <- tvar_market$model.specific$regime
+  stopifnot(length(regime_vec) == nrow(market_df))
+
+  df_reg <- market_df %>%
+    dplyr::mutate(regime = regime_vec) %>%
+    dplyr::select(dplyr::all_of(var_names), regime)
+
+  df_low <- df_reg %>%
+    dplyr::filter(regime == 1L) %>%
+    dplyr::select(dplyr::all_of(var_names)) %>%
+    tidyr::drop_na()
+
+  df_high <- df_reg %>%
+    dplyr::filter(regime == 2L) %>%
+    dplyr::select(dplyr::all_of(var_names)) %>%
+    tidyr::drop_na()
+
+  N_low  <- nrow(df_low)
+  N_high <- nrow(df_high)
+
+  if (N_low <= p_lag | N_high <= p_lag)
+    stop(sprintf("Not enough obs in one regime for VAR at trim = %.2f", trim_val))
+
+  var_low  <- vars::VAR(df_low,  p = p_lag, type = "const")
+  var_high <- vars::VAR(df_high, p = p_lag, type = "const")
+
+  list(
+    trim      = trim_val,
+    threshold = tau,
+    N_low     = N_low,
+    N_high    = N_high,
+    low_tab   = format_var_table(var_low),
+    high_tab  = format_var_table(var_high)
+  )
+}
+
+
+###loop and run the tvar w our diff trim values##
+
+trims   <- c(0.10, 0.15, 0.20)
+results <- lapply(trims, run_market_tvar_tables)
+
+doc <- officer::read_docx()
+
+for (res in results) {
+
+  doc <- officer::body_add_par(
+    doc,
+    value = sprintf("TVAR Market Coefficients (trim = %.2f, τ = %.2f)",
+                    res$trim, res$threshold),
+    style = "heading 1"
+  )
+
+  doc <- officer::body_add_par(
+    doc,
+    value = sprintf("Market – Low EPU (N = %d)", res$N_low),
+    style = "heading 2"
+  )
+
+  doc <- flextable::body_add_flextable(
+    x   = doc,
+    value = flextable::flextable(res$low_tab)
+  )
+
+  doc <- officer::body_add_par(doc, value = "", style = "Normal")
+
+  doc <- officer::body_add_par(
+    doc,
+    value = sprintf("Market – High EPU (N = %d)", res$N_high),
+    style = "heading 2"
+  )
+
+  doc <- flextable::body_add_flextable(
+    x   = doc,
+    value = flextable::flextable(res$high_tab)
+  )
+
+  doc <- officer::body_add_par(doc, value = "", style = "Normal")
+}
+
+print(doc, target = "market_TVAR_VARcoeffs_all_trims.docx")
+
+```
+
+
+
+###Eigenvalue modulus test###
+```{r}
+library(dplyr)
+library(tidyr)
+library(vars)
+library(purrr)
+library(tibble)
+
+var_names <- c("d_cds", "d_vol", "ret")
+p_lag     <- 2
+
+
+run_regime_stability_for_sector <- function(sec, sector_panel, sector_models, p = p_lag) {
+
+  df_s <- sector_panel %>%
+    filter(sector == sec) %>%
+    arrange(date) %>%
+    mutate(
+      d_cds = PS_eq     - lag(PS_eq),
+      d_vol = sector_iv - lag(sector_iv),
+      ret   = RET_eq
+    ) %>%
+    tidyr::drop_na(d_cds, d_vol, ret, EPU)
+
+  mod_sec    <- sector_models[[sec]]
+  regime_vec <- mod_sec$model.specific$regime
+  stopifnot(length(regime_vec) == nrow(df_s))
+
+  df_reg <- df_s
+  df_reg$regime <- regime_vec
+  df_reg <- df_reg[, c("date", var_names, "EPU", "regime")]
+  df_reg <- df_reg[complete.cases(df_reg[, c(var_names, "regime")]), , drop = FALSE]
+
+  # split by regime
+  df_low  <- df_reg[df_reg$regime == 1, var_names, drop = FALSE]
+  df_high <- df_reg[df_reg$regime == 2, var_names, drop = FALSE]
+
+  df_low  <- df_low[complete.cases(df_low),  , drop = FALSE]
+  df_high <- df_high[complete.cases(df_high), , drop = FALSE]
+
+  n_low  <- nrow(df_low)
+  n_high <- nrow(df_high)
+
+  if (n_low <= p || n_high <= p) {
+    return(
+      tibble(
+        sector     = sec,
+        regime     = c("Low EPU", "High EPU"),
+        n_obs      = c(n_low, n_high),
+        max_mod    = NA_real_,
+        stable_VAR = NA
+      )
+    )
+  }
+
+
+  var_low  <- VAR(df_low,  p = p, type = "const")
+  var_high <- VAR(df_high, p = p, type = "const")
+
+
+  eig_low  <- roots(var_low,  modulus = TRUE)
+  eig_high <- roots(var_high, modulus = TRUE)
+
+
+  tibble(
+    sector     = sec,
+    regime     = c("Low EPU", "High EPU"),
+    n_obs      = c(n_low, n_high),
+    max_mod    = c(max(eig_low), max(eig_high)),
+    stable_VAR = c(all(eig_low  < 1), all(eig_high < 1))
+  )
+}
+
+
+
+sectors_use <- names(sector_models)   
+
+stability_results <- map_dfr(
+  sectors_use,
+  ~ run_regime_stability_for_sector(.x, sector_panel, sector_models, p = p_lag)
+)
+
+stability_results
+
+
+```
+
+
+
+#joint portmanteau but on all sectors###
+```{r}
+
+library(tidyr)
+library(vars)
+library(purrr)
+library(tibble)
+library(dplyr)
+
+var_names <- c("d_cds", "d_vol", "ret")
+p_lag     <- 2     
+lag_pt    <- 10    # Portmanteau test lag not tvar
+
+run_joint_portmanteau_sector <- function(sec,
+                                         sector_panel,
+                                         sector_models,
+                                         p      = p_lag,
+                                         lag_pt = lag_pt) {
+
+
+  df_s <- sector_panel %>%
+    filter(sector == sec) %>%
+    arrange(date) %>%
+    mutate(
+      d_cds = PS_eq     - lag(PS_eq),
+      d_vol = sector_iv - lag(sector_iv),
+      ret   = RET_eq
+    ) %>%
+    tidyr::drop_na(d_cds, d_vol, ret, EPU)
+
+
+  mod_sec    <- sector_models[[sec]]
+  regime_vec <- mod_sec$model.specific$regime
+  stopifnot(length(regime_vec) == nrow(df_s))
+
+  df_reg <- df_s %>%
+    mutate(regime = regime_vec) %>%
+    dplyr::select(all_of(var_names), regime)
+
+  df_low  <- df_reg %>% filter(regime == 1L) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+  df_high <- df_reg %>% filter(regime == 2L) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+
+  N_low  <- nrow(df_low)
+  N_high <- nrow(df_high)
+
+
+  if (N_low <= p || N_high <= p) {
+    return(
+      tibble(
+        sector = sec,
+        regime = c("Low EPU", "High EPU"),
+        N      = c(N_low, N_high),
+        p_value = NA_real_
+      )
+    )
+  }
+
+
+  var_low  <- VAR(df_low,  p = p, type = "const")
+  var_high <- VAR(df_high, p = p, type = "const")
+
+
+  pt_low  <- serial.test(var_low,  lags.pt = lag_pt, type = "PT.asymptotic")
+  pt_high <- serial.test(var_high, lags.pt = lag_pt, type = "PT.asymptotic")
+
+  tibble(
+    sector  = sec,
+    regime  = c("Low EPU", "High EPU"),
+    N       = c(N_low, N_high),
+    p_value = c(pt_low$serial$p.value,
+                pt_high$serial$p.value)
+  )
+}
+
+
+sectors_use <- setdiff(names(sector_models), "Telecommunications Services")
+
+joint_portmanteau_results <- purrr::map_dfr(
+  sectors_use,
+  ~ run_joint_portmanteau_sector(.x, sector_panel, sector_models,
+                                 p = p_lag, lag_pt = 10)
+)
+
+joint_portmanteau_results
+```
+
+###Wald Test and Significance Plot for our sectors###
+```{r}
+library(dplyr)
+library(tidyr)
+library(vars)
+library(purrr)
+library(tibble)
+
+var_names <- c("d_cds", "ret", "d_vol")
+
+run_regime_granger_for_sector <- function(sec, sector_panel, sector_models, p = 2) {
+
+  df_s <- sector_panel %>%
+    filter(sector == sec) %>%
+    arrange(date) %>%
+    mutate(
+      d_cds = PS_eq     - lag(PS_eq),
+      d_vol = sector_iv - lag(sector_iv),
+      ret   = RET_eq
+    ) %>%
+    tidyr::drop_na(d_cds, d_vol, ret, EPU)
+
+  mod_sec    <- sector_models[[sec]]
+  regime_vec <- mod_sec$model.specific$regime
+
+  stopifnot(length(regime_vec) == nrow(df_s))
+
+
+  df_reg <- df_s
+  df_reg$regime <- regime_vec
+
+  df_reg <- df_reg[, c("date", var_names, "EPU", "regime")]
+
+ 
+  df_reg <- df_reg[complete.cases(df_reg[, c(var_names, "regime")]), , drop = FALSE]
+
+
+  df_low  <- df_reg[df_reg$regime == 1, var_names, drop = FALSE]
+  df_high <- df_reg[df_reg$regime == 2, var_names, drop = FALSE]
+
+
+  df_low  <- df_low[complete.cases(df_low),  , drop = FALSE]
+  df_high <- df_high[complete.cases(df_high), , drop = FALSE]
+
+
+  if (nrow(df_low) <= p || nrow(df_high) <= p) {
+    return(
+      tibble(
+        sector    = sec,
+        direction = c("VOL → CDS", "RET → CDS", "CDS → VOL"),
+        p_low     = NA_real_,
+        p_high    = NA_real_
+      )
+    )
+  }
+
+
+  var_low  <- VAR(df_low,  p = p, type = "const")
+  var_high <- VAR(df_high, p = p, type = "const")
+
+
+  p_low_VtoCDS  <- causality(var_low,  cause = "d_vol")$Granger$p.value
+  p_high_VtoCDS <- causality(var_high, cause = "d_vol")$Granger$p.value
+
+
+  p_low_RtoCDS  <- causality(var_low,  cause = "ret")$Granger$p.value
+  p_high_RtoCDS <- causality(var_high, cause = "ret")$Granger$p.value
+
+
+  p_low_CDStoV  <- causality(var_low,  cause = "d_cds")$Granger$p.value
+  p_high_CDStoV <- causality(var_high, cause = "d_cds")$Granger$p.value
+
+  tibble(
+    sector    = sec,
+    direction = c("VOL → CDS", "RET → CDS", "CDS → VOL"),
+    p_low     = c(p_low_VtoCDS,  p_low_RtoCDS,  p_low_CDStoV),
+    p_high    = c(p_high_VtoCDS, p_high_RtoCDS, p_high_CDStoV)
+  )
+}
+
+
+sectors <- names(sector_models)
+
+granger_sector_results <- purrr::map_dfr(
+  sectors,
+  ~ run_regime_granger_for_sector(.x, sector_panel, sector_models, p = 2)
+)
+
+granger_sector_results <- granger_sector_results %>%
+  filter(sector != "Telecommunications Services")
+
+
+granger_sector_results
+
+
+
+
+add_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p)      ~ "",
+    p < 0.01      ~ "***",
+    p < 0.05      ~ "**",
+    p < 0.10      ~ "*",
+    TRUE          ~ ""
+  )
+}
+
+granger_sector_table <- granger_sector_results %>%
+
+  dplyr::mutate(
+    direction_code = dplyr::case_when(
+      direction == "VOL → CDS" ~ "VtoCDS",
+      direction == "RET → CDS" ~ "RETtoCDS",
+      direction == "CDS → VOL" ~ "CDStoV",
+      TRUE ~ direction
+    ),
+    
+    p_low_star  = dplyr::if_else(
+      is.na(p_low),
+      NA_character_,
+      sprintf("%.3f%s", round(p_low, 3),  add_stars(p_low))
+    ),
+    p_high_star = dplyr::if_else(
+      is.na(p_high),
+      NA_character_,
+      sprintf("%.3f%s", round(p_high, 3), add_stars(p_high))
+    )
+  ) %>%
+  dplyr::select(sector, direction_code, p_low_star, p_high_star) %>%
+  tidyr::pivot_wider(
+    id_cols    = sector,
+    names_from = direction_code,
+    values_from = c(p_low_star, p_high_star),
+    names_glue = "{direction_code}_{.value}"
+  ) %>%
+  # optional: reorder columns
+  dplyr::select(
+    sector,
+    VtoCDS_p_low_star,  VtoCDS_p_high_star,
+    RETtoCDS_p_low_star, RETtoCDS_p_high_star,
+    CDStoV_p_low_star,  CDStoV_p_high_star
+  )
+
+granger_sector_table
+
+plot_df <- granger_sector_results %>%
+  pivot_longer(
+    cols      = c(p_low, p_high),
+    names_to  = "regime",
+    values_to = "p_value"
+  ) %>%
+  mutate(
+    regime = dplyr::recode(
+      regime,
+      "p_low"  = "Low EPU regime",
+      "p_high" = "High EPU regime"
+    ),
+    stars  = add_stars(p_value),
+    neg_log_p = ifelse(is.na(p_value) | p_value <= 0,
+                       NA_real_,
+                       -log10(p_value))
+  )
+
+sig_summary <- plot_df %>%
+  mutate(sig_10 = !is.na(p_value) & p_value < 0.05) %>%
+  group_by(regime, direction) %>%
+  summarise(
+    n_sectors      = n_distinct(sector),
+    n_sig          = sum(sig_10),
+    frac_sig       = n_sig / n_sectors,
+    .groups = "drop"
+  )
+
+
+##plot share of sig firms##
+ggplot(sig_summary, aes(x = direction, y = frac_sig, fill = regime)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(
+    values = c(
+      "Low EPU regime"  = "#1B1B1B", 
+      "High EPU regime" = "#1F4E89"  
+    )
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Direction of Granger Causality",
+    y = "Share of Sectors with p value < 0.05",
+    title = "Share of Sectors with significant directional relationship",
+    fill = "Regime"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+##building sum stats for report##
+```{r}
+library(dplyr)
+library(tidyr)
+library(scales)
+
+
+sum_stat <- df3 %>%
+  dplyr::select(ticker, sector, diff_parspread, RET, diff_impvol, daily_policy_index) %>%
+  drop_na()
+sum_stat <- df3 %>%
+  dplyr::filter(sector != "Telecommunications") %>%
+  dplyr::select(ticker, sector, diff_parspread, RET, diff_impvol, daily_policy_index) %>%
+  drop_na()
+
+summary_stats <- sum_stat %>%
+  dplyr::select(diff_parspread, RET, diff_impvol, daily_policy_index) %>%
+  pivot_longer(cols = everything()) %>%
+  group_by(name) %>%
+  summarise(
+    N    = n(),
+    Mean = mean(value),
+    SD   = sd(value),
+    Min  = min(value),
+    Max  = max(value)
+  ) %>%
+  mutate(
+    Variable = dplyr::recode(name,
+      diff_parspread       = "Δ CDS Spread",
+      RET                  = "Stock Returns",
+      diff_impvol          = "Δ Implied Volatility",
+      daily_policy_index  = "Policy Uncertainty (EPU)"
+    ),
+    Mean = number(Mean, accuracy = 0.00001),
+    SD   = number(SD,   accuracy = 0.00001),
+    Min  = number(Min,  accuracy = 0.00001),
+    Max  = number(Max,  accuracy = 0.00001)
+  ) %>%
+  dplyr::select(Variable, N, Mean, SD, Min, Max)
+
+library(officer)
+library(flextable)
+
+
+doc_summ <- read_docx()
+
+
+doc_summ <- body_add_par(doc_summ,
+                         value = "Summary Statistics",
+                         style = "heading 2")
+
+
+doc_summ <- body_add_flextable(doc_summ, flextable(summary_stats))
+
+
+print(doc_summ, target = "summary_stats.docx")
+
+```
+
+
+###EPU graph###
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+
+epu_raw <- read.csv("~/Documents/Eco475/EPU_data_ext.csv")
+
+
+epu_dail <- epu_raw %>%
+  mutate(
+    date = as.Date(sprintf("%04d-%02d-%02d", year, month, day))
+  ) %>%
+  filter(year < 2024)
+
+
+ggplot(epu_dail, aes(x = date, y = daily_policy_index)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    title = "Economic Policy Uncertainty (Daily, 2017–2023)",
+    x = "Date",
+    y = "EPU Index"
+  ) +
+  theme_minimal(base_size = 13)
+
+library(dplyr)
+library(ggplot2)
+
+
+
+thr <- 197.2   
+
+epu_dail <- epu_dail %>%
+  mutate(
+    color_flag = ifelse(daily_policy_index < thr, "Below", "Above")
+  )
+
+ggplot(epu_dail, aes(x = date, y = daily_policy_index)) +
+  geom_line(
+    aes(color = color_flag, group = 1),  
+    linewidth = 0.35
+  ) +
+  geom_hline(
+    yintercept = thr,
+    color = "red",
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  scale_color_manual(
+    values = c("Below" = "darkblue", "Above" = "black"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Economic Policy Uncertainty with TVAR Threshold (2017-2023)",
+    x = "Date",
+    y = "EPU Index"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```

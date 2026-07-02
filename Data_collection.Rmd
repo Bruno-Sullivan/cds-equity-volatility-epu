@@ -1,0 +1,402 @@
+---
+title: "Compiling dataset"
+author: "Bruno Sullivan"
+date: "2025-12-05"
+output: html_document
+---
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+
+p17 <- read.csv("prices2017.csv")
+p18 <- read.csv("prices2018.csv")
+p19 <- read.csv("prices2019.csv")
+p20 <- read.csv("prices2020.csv")
+p21 <- read.csv("prices2021.csv")
+p22 <- read.csv("prices2022.csv")
+p23 <- read.csv("prices2023.csv")
+
+c17 <- read.csv("cdsdata_2017.csv")
+c18 <- read.csv("cdsdata_2018.csv")
+c19 <- read.csv("cdsdata_2019.csv")
+c20 <- read.csv("cdsdata_2020.csv")
+c21 <- read.csv("cdsdata_2021.csv")
+c22 <- read.csv("cdsdata_2022.csv")
+c23 <- read.csv("cdsdata_2023.csv")
+
+i17_19 <- read.csv("DailyImpliedVolatility2017_2019.csv")
+i20_21 <- read.csv("DailyImpliedVolatility2020_2021.csv")
+i22_23 <- read.csv("DailyImpliedVolatility2022_2023.csv")
+
+
+##cut out 2024-25 due to lack of implied volatility data###
+combine_market_data <- function(start_date = "2017-01-01",
+                                end_date   = "2023-12-31") {
+
+
+  all_prices <- dplyr::bind_rows(p17, p18, p19, p20, p21, p22, p23)
+  names(all_prices)[names(all_prices) == "TICKER"] <- "ticker"
+  all_prices$date <- as.Date(all_prices$date)
+
+  all_prices <- all_prices %>%
+    dplyr::select(ticker, date, PRC, VOL, RET, SHROUT) %>%
+    dplyr::distinct(ticker, date, .keep_all = TRUE)
+
+  
+  all_cds <- dplyr::bind_rows(c17, c18, c19, c20, c21, c22, c23)
+  all_cds$date <- as.Date(all_cds$date)
+
+  all_cds <- all_cds %>%
+    dplyr::select(ticker, date, parspread, sector) %>%
+    dplyr::distinct(ticker, date, .keep_all = TRUE)
+
+
+  all_iv <- dplyr::bind_rows(i17_19, i20_21, i22_23)
+  all_iv$date <- as.Date(all_iv$date)
+
+  all_iv <- all_iv %>%
+    dplyr::select(ticker, date, impl_volatility) %>%
+    dplyr::distinct(ticker, date, .keep_all = TRUE)
+
+  ###taking only tickers common across all 3 datasets###
+
+  common_tickers <- Reduce(
+    intersect,
+    list(
+      unique(all_prices$ticker),
+      unique(all_cds$ticker),
+      unique(all_iv$ticker)
+    )
+  )
+
+  prices_common <- all_prices[all_prices$ticker %in% common_tickers, ]
+  cds_common    <- all_cds[all_cds$ticker %in% common_tickers, ]
+  iv_common     <- all_iv[all_iv$ticker %in% common_tickers, ]
+
+  all_dates <- seq(as.Date(start_date), as.Date(end_date), by = "day")
+
+  complete_grid <- tidyr::expand_grid(
+    ticker = common_tickers,
+    date   = all_dates
+  ) %>%
+    as_tibble() %>%
+    dplyr::mutate(date = as.Date(date))
+
+  join_with_grid <- function(df, grid) {
+    grid %>%
+      dplyr::left_join(df, by = c("ticker", "date")) %>%
+      dplyr::arrange(ticker, date)
+  }
+
+  prices_complete <- join_with_grid(prices_common, complete_grid)
+  cds_complete    <- join_with_grid(cds_common,    complete_grid)
+  iv_complete     <- join_with_grid(iv_common,     complete_grid)
+
+  cds_subset <- cds_complete %>%
+    dplyr::select(ticker, date, parspread, sector)
+
+  iv_subset <- iv_complete %>%
+    dplyr::select(ticker, date, impl_volatility)
+
+  combined_data <- prices_complete %>%
+    dplyr::left_join(cds_subset, by = c("ticker", "date")) %>%
+    dplyr::left_join(iv_subset,  by = c("ticker", "date")) %>%
+    dplyr::arrange(ticker, date)
+
+  combined_data
+}
+
+combined_data <- combine_market_data()
+
+write.csv(combined_data,
+          "combined_market_data_2017_2023.csv",
+          row.names = FALSE)
+
+
+
+focused_columns <- c("ticker", "date", "impl_volatility", "parspread", "RET")
+
+focused_data <- combined_data %>%
+  dplyr::select(dplyr::all_of(focused_columns))
+
+focused_data$RET <- as.numeric(focused_data$RET)
+
+#check missing values#
+
+overall_na <- focused_data %>%
+  dplyr::summarise(
+    total_obs        = dplyr::n(),
+    iv_missing       = sum(is.na(impl_volatility)),
+    iv_present       = sum(!is.na(impl_volatility)),
+    iv_missing_pct   = round(mean(is.na(impl_volatility)) * 100, 2),
+    spread_missing   = sum(is.na(parspread)),
+    spread_present   = sum(!is.na(parspread)),
+    spread_missing_pct = round(mean(is.na(parspread)) * 100, 2),
+    ret_missing      = sum(is.na(RET)),
+    ret_present      = sum(!is.na(RET)),
+    ret_missing_pct  = round(mean(is.na(RET)) * 100, 2)
+  )
+
+print(overall_na)
+
+
+ticker_completeness <- focused_data %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::summarise(
+    total_days        = dplyr::n(),
+    all_three_present = sum(
+      !is.na(impl_volatility) &
+      !is.na(parspread) &
+      !is.na(RET)
+    ),
+    pct_all_three     = round(all_three_present / total_days * 100, 2),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(pct_all_three)
+
+write.csv(ticker_completeness,
+          "ticker_completeness_full.csv",
+          row.names = FALSE)
+
+##drop tickers with less than 40% of total days###
+
+completeness_threshold <- 40
+
+acceptable_tickers_40 <- ticker_completeness %>%
+  dplyr::filter(pct_all_three >= completeness_threshold) %>%
+  dplyr::pull(ticker)
+
+filtered_data_40 <- focused_data %>%
+  dplyr::filter(ticker %in% acceptable_tickers_40)
+
+write.csv(filtered_data_40,
+          "filtered_data_40percent.csv",
+          row.names = FALSE)
+
+#now checking again for missing values#
+
+pattern_analysis_40 <- filtered_data_40 %>%
+  dplyr::mutate(
+    iv_missing     = is.na(impl_volatility),
+    spread_missing = is.na(parspread),
+    ret_missing    = is.na(RET),
+    num_missing    = iv_missing + spread_missing + ret_missing,
+    num_present    = 3 - num_missing,
+    pattern_category = dplyr::case_when(
+      num_missing == 0,                      
+      num_missing == 1 & iv_missing,
+      num_missing == 1 & spread_missing,
+      num_missing == 1 & ret_missing,
+      num_missing == 2 & !iv_missing,
+      num_missing == 2 & !spread_missing,
+      num_missing == 2 & !ret_missing,
+      num_missing == 3,
+      TRUE  
+    ),
+    missing_var = dplyr::case_when(
+      num_missing == 1 & iv_missing, 
+      num_missing == 1 & spread_missing,
+      num_missing == 1 & ret_missing,
+      TRUE                      
+    ),
+    present_var = dplyr::case_when(
+      num_present == 1 & !iv_missing,
+      num_present == 1 & !spread_missing,
+      num_present == 1 & !ret_missing,
+      TRUE                            
+    )
+  )
+
+total_obs_40 <- nrow(pattern_analysis_40)
+
+pattern_summary_40 <- pattern_analysis_40 %>%
+  dplyr::count(pattern_category) %>%
+  dplyr::mutate(
+    percentage = round(n / total_obs_40 * 100, 2)
+  ) %>%
+  dplyr::arrange(dplyr::desc(n))
+
+print(pattern_summary_40)
+
+
+aggregated_summary_40 <- pattern_analysis_40 %>%
+  dplyr::summarise(
+    Total_Observations    = dplyr::n(),
+    IV_Missing_Rate       = round(mean(iv_missing) * 100, 2),
+    Spread_Missing_Rate   = round(mean(spread_missing) * 100, 2),
+    RET_Missing_Rate      = round(mean(ret_missing) * 100, 2),
+    All_Three_Present     = sum(num_missing == 0),
+    All_Three_Present_Pct = round(mean(num_missing == 0) * 100, 2),
+    One_Missing_Total     = sum(num_missing == 1),
+    One_Missing_Pct       = round(mean(num_missing == 1) * 100, 2),
+    One_Present_Total     = sum(num_present == 1),
+    One_Present_Pct       = round(mean(num_present == 1) * 100, 2),
+    All_Missing_Total     = sum(num_missing == 3),
+    All_Missing_Pct       = round(mean(num_missing == 3) * 100, 2),
+    Two_Missing_Total     = sum(num_missing == 2),
+    Two_Missing_Pct       = round(mean(num_missing == 2) * 100, 2)
+  )
+
+print(aggregated_summary_40)
+
+
+
+one_missing_breakdown_40 <- pattern_analysis_40 %>%
+  dplyr::filter(num_missing == 1) %>%
+  dplyr::count(missing_var) %>%
+  dplyr::mutate(
+    total_one_missing        = sum(n),
+    pct_of_one_missing      = round(n / total_one_missing * 100, 2),
+    pct_of_total_40         = round(n / total_obs_40 * 100, 2)
+  )
+
+one_present_breakdown_40 <- pattern_analysis_40 %>%
+  dplyr::filter(num_present == 1) %>%
+  dplyr::count(present_var) %>%
+  dplyr::mutate(
+    total_one_present       = sum(n),
+    pct_of_one_present      = round(n / total_one_present * 100, 2),
+    pct_of_total_40         = round(n / total_obs_40 * 100, 2)
+  )
+
+
+write.csv(pattern_summary_40,
+          "detailed_pattern_summary_40percent.csv",
+          row.names = FALSE)
+
+formatted_aggregated_40 <- data.frame(
+  Metric = c(
+    "Total Observations",
+    "IV Missing Rate (%)",
+    "Spread Missing Rate (%)",
+    "RET Missing Rate (%)",
+    "All Three Present (count)",
+    "All Three Present (%)",
+    "Exactly One Missing (count)",
+    "Exactly One Missing (%)",
+    "Exactly One Present (count)",
+    "Exactly One Present (%)",
+    "All Missing (count)",
+    "All Missing (%)",
+    "Two Missing (count)",
+    "Two Missing (%)"
+  ),
+  Value = c(
+    aggregated_summary_40$Total_Observations,
+    aggregated_summary_40$IV_Missing_Rate,
+    aggregated_summary_40$Spread_Missing_Rate,
+    aggregated_summary_40$RET_Missing_Rate,
+    aggregated_summary_40$All_Three_Present,
+    aggregated_summary_40$All_Three_Present_Pct,
+    aggregated_summary_40$One_Missing_Total,
+    aggregated_summary_40$One_Missing_Pct,
+    aggregated_summary_40$One_Present_Total,
+    aggregated_summary_40$One_Present_Pct,
+    aggregated_summary_40$All_Missing_Total,
+    aggregated_summary_40$All_Missing_Pct,
+    aggregated_summary_40$Two_Missing_Total,
+    aggregated_summary_40$Two_Missing_Pct
+  )
+)
+
+write.csv(formatted_aggregated_40,
+          "aggregated_summary_40percent.csv",
+          row.names = FALSE)
+
+
+ticker_stats_40 <- filtered_data_40 %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::summarise(
+    total_days        = dplyr::n(),
+    iv_missing        = sum(is.na(impl_volatility)),
+    spread_missing    = sum(is.na(parspread)),
+    ret_missing       = sum(is.na(RET)),
+    all_three_present = sum(
+      !is.na(impl_volatility) &
+      !is.na(parspread) &
+      !is.na(RET)
+    ),
+    pct_all_three     = round(all_three_present / total_days * 100, 2),
+    pct_iv_missing    = round(iv_missing / total_days * 100, 2),
+    pct_spread_missing = round(spread_missing / total_days * 100, 2),
+    pct_ret_missing   = round(ret_missing / total_days * 100, 2),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(pct_all_three))
+
+write.csv(ticker_stats_40,
+          "ticker_level_stats_40percent.csv",
+          row.names = FALSE)
+
+##building our final dataset##
+
+simple_final_data <- filtered_data_40 %>%
+  dplyr::arrange(ticker, date)
+
+write.csv(simple_final_data,
+          "iv-return-spread-simple.csv",
+          row.names = FALSE)
+
+
+completeness_check <- simple_final_data %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::summarise(
+    total_days   = dplyr::n(),
+    all_three    = sum(
+      !is.na(impl_volatility) &
+      !is.na(parspread) &
+      !is.na(RET)
+    ),
+    completeness = all_three / total_days * 100,
+    .groups = "drop"
+  )
+
+write.csv(completeness_check,
+          "simple_final_completeness_by_ticker.csv",
+          row.names = FALSE)
+
+#loading our epu and merging it for complete database##
+
+epu_df <- read.csv("EPU_data_ext.csv")
+epu_df$date       <- as.Date(epu_df$date)
+combined_data$date <- as.Date(combined_data$date)
+combined_data <- combined_data %>%
+  dplyr::left_join(
+    epu_df,
+    by = "date"
+  )
+
+
+###summary statisitcs table###
+
+sum_stat <- combined_data %>%
+  dplyr::select(ticker, sector, diff_parspread, RET, diff_impvol, daily_policy_index) %>%
+  drop_na()
+
+summary_stats <- df_clean %>%
+  dplyr::select(diff_parspread, RET, diff_impvol, daily_policy_index) %>%
+  pivot_longer(cols = everything()) %>%
+  group_by(name) %>%
+  summarise(
+    N    = n(),
+    Mean = mean(value),
+    SD   = sd(value),
+    Min  = min(value),
+    Max  = max(value)
+  ) %>%
+  mutate(
+    Variable = recode(name,
+      d_log_cds = "Δ log(CDS)",
+      ret       = "Stock Returns",
+      d_log_iv  = "Δ log(Implied Volatility)",
+      EPU       = "Policy Uncertainty (EPU)"
+    )
+  ) %>%
+  select(Variable, N, Mean, SD, Min, Max)
+
+```

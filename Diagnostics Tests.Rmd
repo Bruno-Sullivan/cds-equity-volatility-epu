@@ -1,0 +1,323 @@
+---
+title: "Diagnostics TVAR"
+author: "Bruno Sullivan"
+date: "2025-12-05"
+output: html_document
+---
+###Tanay diagnostic tests##
+```{r}
+##lag selection##
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(vars)
+library(tsDyn)
+library(tseries)
+library(ggplot2)
+
+var_names <- c("d_cds", "d_vol", "ret")
+lag_pt    <- 10 
+
+
+lag_max <- 10
+lag_sel <- VARselect(df_m[, var_names], lag.max = lag_max, type = "const")
+lag_sel
+
+p_lag <- 2
+
+```
+
+## Build Regime Specific VARs from TVARs
+```{r}
+
+
+build_regime_VARs <- function(df_m, tvar_obj, p = p_lag) {
+  reg <- tvar_obj$model.specific$regime
+  stopifnot(length(reg) == nrow(df_m))
+
+  df_reg <- df_m %>%
+    mutate(regime = reg) %>%
+    dplyr::select(all_of(var_names), regime)
+
+  df_low  <- df_reg %>% filter(regime == 1L) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+  df_high <- df_reg %>% filter(regime == 2L) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+
+  n_low  <- nrow(df_low)
+  n_high <- nrow(df_high)
+
+  if (n_low <= p || n_high <= p) {
+    warning("Not enough observations in at least one regime for VAR(p).")
+    return(list(
+      df_low   = df_low,
+      df_high  = df_high,
+      var_low  = NULL,
+      var_high = NULL,
+      N_low    = n_low,
+      N_high   = n_high
+    ))
+  }
+
+  var_low  <- VAR(df_low,  p = p, type = "const")
+  var_high <- VAR(df_high, p = p, type = "const")
+
+  list(
+    df_low   = df_low,
+    df_high  = df_high,
+    var_low  = var_low,
+    var_high = var_high,
+    N_low    = n_low,
+    N_high   = n_high
+  )
+}
+
+```
+
+
+## Eigenvalue Modulus
+
+
+```{r}
+
+compute_stability <- function(var_low, var_high) {
+  if (is.null(var_low) || is.null(var_high)) {
+    return(
+      tibble(
+        regime     = c("Low EPU", "High EPU"),
+        max_mod    = NA_real_,
+        stable_VAR = NA
+      )
+    )
+  }
+
+  eig_low  <- roots(var_low,  modulus = TRUE)
+  eig_high <- roots(var_high, modulus = TRUE)
+
+  tibble(
+    regime     = c("Low EPU", "High EPU"),
+    max_mod    = c(max(eig_low), max(eig_high)),
+    stable_VAR = c(all(eig_low  < 1), all(eig_high < 1))
+  )
+}
+```
+
+
+
+```{r}
+
+
+total_SSR_VAR <- function(var_fit) {
+  sum(unlist(lapply(var_fit$varresult, function(eq) sum(residuals(eq)^2))))
+}
+
+compute_ssr_grid <- function(df_m,
+                             p      = p_lag,
+                             n_grid = 30,
+                             trim   = 0.15) {
+
+  df <- df_m %>%
+    arrange(date) %>%
+    drop_na(d_cds, d_vol, ret, EPU)
+
+  th <- df$EPU
+
+  th_lo   <- quantile(th, trim,     na.rm = TRUE)
+  th_hi   <- quantile(th, 1 - trim, na.rm = TRUE)
+  th_grid <- seq(th_lo, th_hi, length.out = n_grid)
+
+  map_dfr(th_grid, function(gamma) {
+
+    df_reg <- df %>%
+      mutate(regime = if_else(EPU <= gamma, 1L, 2L)) %>%
+      dplyr::select(all_of(var_names), regime)
+
+    df_low  <- df_reg %>% filter(regime == 1L) %>%
+      dplyr::select(all_of(var_names)) %>% drop_na()
+    df_high <- df_reg %>% filter(regime == 2L) %>%
+      dplyr::select(all_of(var_names)) %>% drop_na()
+
+    if (nrow(df_low) <= p || nrow(df_high) <= p) {
+      return(tibble(threshold = gamma, SSR = NA_real_))
+    }
+
+    var_low  <- VAR(df_low,  p = p, type = "const")
+    var_high <- VAR(df_high, p = p, type = "const")
+
+    SSR_total <- total_SSR_VAR(var_low) + total_SSR_VAR(var_high)
+
+    tibble(threshold = gamma, SSR = SSR_total)
+  })
+}
+```
+
+```{r}
+
+
+library(dplyr)
+library(tidyr)
+library(tsDyn)
+library(vars)
+library(tseries)
+
+sec_name <- "Healthcare"  
+
+var_names <- c("d_cds", "d_vol", "ret")
+
+df_s <- sector_panel %>%
+  filter(sector == sec_name) %>%
+  arrange(date) %>%
+  mutate(
+    d_cds = PS_eq     - lag(PS_eq),
+    d_vol = sector_iv - lag(sector_iv),
+    ret   = RET_eq
+  ) %>%
+  drop_na(d_cds, d_vol, ret, EPU)
+
+Y_sec  <- as.matrix(df_s[, var_names])
+th_sec <- df_s$EPU
+
+lag_sel_sec <- VARselect(df_s[, var_names], lag.max = 2, type = "const")
+print(lag_sel_sec)
+
+
+p_sec <- 2
+
+tvar_sec <- TVAR(
+  data    = Y_sec,
+  lag     = p_sec,
+  nthresh = 1,
+  thVar   = th_sec,
+  trim    = 0.15,
+  model   = "TAR"
+)
+
+print(tvar_sec)
+
+
+regime_vec <- tvar_sec$model.specific$regime
+stopifnot(length(regime_vec) == nrow(df_s))
+
+df_reg <- df_s %>%
+  mutate(regime = regime_vec) %>%
+  dplyr::select(all_of(var_names), regime)
+
+df_low  <- df_reg %>%
+  filter(regime == 1L) %>%
+  dplyr::select(all_of(var_names)) %>%
+  drop_na()
+
+df_high <- df_reg %>%
+  filter(regime == 2L) %>%
+  dplyr::select(all_of(var_names)) %>%
+  drop_na()
+
+cat("Obs in low regime:",  nrow(df_low),  "\n")
+cat("Obs in high regime:", nrow(df_high), "\n")
+
+var_low_sec  <- VAR(df_low,  p = p_sec, type = "const")
+var_high_sec <- VAR(df_high, p = p_sec, type = "const")
+
+
+eig_low  <- roots(var_low_sec,  modulus = TRUE)
+eig_high <- roots(var_high_sec, modulus = TRUE)
+
+stab_tbl_sec <- data.frame(
+  sector     = sec_name,
+  regime     = c("Low EPU", "High EPU"),
+  max_mod    = c(max(eig_low), max(eig_high)),
+  stable_VAR = c(all(eig_low < 1), all(eig_high < 1))
+)
+
+
+print(stab_tbl_sec)
+
+
+```
+
+
+
+```{r}
+library(tidyr)
+library(vars)
+library(purrr)
+library(tibble)
+library(dplyr)
+
+var_names <- c("d_cds", "d_vol", "ret")
+p_lag     <- 2      # VAR lag order
+lag_pt    <- 10    # Portmanteau test lag
+
+run_joint_portmanteau_sector <- function(sec,
+                                         sector_panel,
+                                         sector_models,
+                                         p      = p_lag,
+                                         lag_pt = lag_pt) {
+
+
+ df_s <- sector_panel %>%
+  filter(sector == sec) %>%
+  arrange(date) %>%
+  mutate(
+    d_cds = PS_eq     - lag(PS_eq),
+    d_vol = sector_iv - lag(sector_iv),
+    ret   = RET_eq
+  ) %>%
+  tidyr::drop_na(d_cds, d_vol, ret)   # <-- EPU removed here
+
+
+  mod_sec    <- sector_models[[sec]]
+  regime_vec <- mod_sec$model.specific$regime
+  stopifnot(length(regime_vec) == nrow(df_s))
+
+  df_reg <- df_s %>%
+    mutate(regime = regime_vec) %>%
+    dplyr::select(all_of(var_names), regime)
+
+  df_low  <- df_reg %>% filter(regime == 1L) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+  df_high <- df_reg %>% filter(regime == 2L) %>% dplyr::select(all_of(var_names)) %>% drop_na()
+
+  N_low  <- nrow(df_low)
+  N_high <- nrow(df_high)
+
+
+  if (N_low <= p || N_high <= p) {
+    return(
+      tibble(
+        sector = sec,
+        regime = c("Low EPU", "High EPU"),
+        N      = c(N_low, N_high),
+        p_value = NA_real_
+      )
+    )
+  }
+
+
+  var_low  <- VAR(df_low,  p = p, type = "const")
+  var_high <- VAR(df_high, p = p, type = "const")
+
+
+  pt_low  <- serial.test(var_low,  lags.pt = lag_pt, type = "PT.asymptotic")
+  pt_high <- serial.test(var_high, lags.pt = lag_pt, type = "PT.asymptotic")
+
+  tibble(
+    sector  = sec,
+    regime  = c("Low EPU", "High EPU"),
+    N       = c(N_low, N_high),
+    p_value = c(pt_low$serial$p.value,
+                pt_high$serial$p.value)
+  )
+}
+
+
+sectors_use <- setdiff(names(sector_models), "Energy")
+
+joint_portmanteau_results <- purrr::map_dfr(
+  sectors_use,
+  ~ run_joint_portmanteau_sector(.x, sector_panel, sector_models,
+                                 p = p_lag, lag_pt = 10)
+)
+
+joint_portmanteau_results
+
+```
